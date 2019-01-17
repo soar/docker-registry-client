@@ -1,21 +1,31 @@
-import logging
-from requests import get, put, delete
-from requests.exceptions import HTTPError
 import json
+import logging
+import warnings
+
+try:
+    from urllib.parse import urljoin, urlsplit
+except ImportError:
+    from urlparse import urljoin, urlsplit
+
+from requests import delete, get, head, post, put
+from requests.exceptions import HTTPError
+
 from .AuthorizationService import AuthorizationService
 from .manifest import sign as sign_manifest
 
+
+# Module setup
+
 # urllib3 throws some ssl warnings with older versions of python
 #   they're probably ok for the registry client to ignore
-import warnings
-warnings.filterwarnings("ignore")
-
+warnings.filterwarnings("ignore", module="urllib3", append=True)
 
 logger = logging.getLogger(__name__)
 
 
 class CommonBaseClient(object):
-    def __init__(self, host, verify_ssl=None, username=None, password=None):
+    def __init__(self, host, verify_ssl=None, username=None, password=None,
+                 api_timeout=None):
         self.host = host
 
         self.method_kwargs = {}
@@ -23,6 +33,8 @@ class CommonBaseClient(object):
             self.method_kwargs['verify'] = verify_ssl
         if username is not None and password is not None:
             self.method_kwargs['auth'] = (username, password)
+        if api_timeout is not None:
+            self.method_kwargs['timeout'] = api_timeout
 
     def _http_response(self, url, method, data=None, **kwargs):
         """url -> full target url
@@ -144,19 +156,52 @@ class BaseClientV2(CommonBaseClient):
     LIST_TAGS = '/v2/{name}/tags/list'
     MANIFEST = '/v2/{name}/manifests/{reference}'
     BLOB = '/v2/{name}/blobs/{digest}'
+    BLOB_MOUNT = '/v2/{name}/blobs/uploads/?mount={digest}&from={origin}'
     schema_1_signed = BASE_CONTENT_TYPE + '.v1+prettyjws'
     schema_1 = BASE_CONTENT_TYPE + '.v1+json'
     schema_2 = BASE_CONTENT_TYPE + '.v2+json'
 
     def __init__(self, *args, **kwargs):
-        auth_service_url = kwargs.pop("auth_service_url", "")
+        host = args[0]
+
+        # Default to the main part of the repository hostname if the service name is missing
+        # or None (the default)
+        auth_service_name = kwargs.pop("auth_service_name", "") or urlsplit(host).netloc
+
+        # Get the URL of the auth service from the args, accounting for the deprecated url arg
+        auth_service_url = kwargs.pop("auth_service_url_full", "")
+        deprecated_auth_service_url_arg = kwargs.pop("auth_service_url", "")
+
+        if deprecated_auth_service_url_arg:
+            warnings.warn(
+                'The auth_service_url argument is deprecated; use auth_service_url_full instead',
+                DeprecationWarning,
+            )
+            if not auth_service_url:
+                auth_service_url = urljoin(deprecated_auth_service_url_arg, 'v2/token')
+
         super(BaseClientV2, self).__init__(*args, **kwargs)
+
+        # If we are using token authentication with v2, we use the username
+        # and pw only for the authorization service and not for the registry
+        # itself.
+        #
+        # We must pop the auth kwarg so it does not get sent to requests,
+        # because override the authentication token if it sees the username/password
+        # provided
+        # See: http://docs.python-requests.org/en/master/user/quickstart/#custom-headers
+        if auth_service_url:
+            auth = self.method_kwargs.pop('auth', None)
+        else:
+            auth = self.method_kwargs.get('auth')
+
         self._manifest_digests = {}
         self.auth = AuthorizationService(
-            registry=self.host,
+            service_name=auth_service_name,
             url=auth_service_url,
             verify=self.method_kwargs.get('verify', False),
-            auth=self.method_kwargs.get('auth', None),
+            auth=auth,
+            api_timeout=self.method_kwargs.get('api_timeout')
         )
 
     @property
@@ -164,7 +209,7 @@ class BaseClientV2(CommonBaseClient):
         return 2
 
     def check_status(self):
-        self.auth.desired_scope = 'registry:catalog:*'
+        self.auth.desired_scope = ''
         return self._http_call('/v2/', get)
 
     def catalog(self):
@@ -192,11 +237,25 @@ class BaseClientV2(CommonBaseClient):
             digest=self._manifest_digests[name, reference],
         )
 
+    def check_manifest(self, name, reference):
+        self.auth.desired_scope = 'repository:%s:*' % name
+        response = self._http_response(
+            self.MANIFEST, head, name=name, reference=reference,
+            schema=self.schema_1_signed,
+        )
+        self._cache_manifest_digest(name, reference, response=response)
+        return response.ok
+
     def put_manifest(self, name, reference, manifest):
         self.auth.desired_scope = 'repository:%s:*' % name
         content = {}
         content.update(manifest._content)
-        content.update({'name': name, 'tag': reference})
+
+        content['name'] = name
+
+        # If reference is a tag, update it; otherwise, leave the tag as is
+        if not reference.startswith('sha256:'):
+            content['tag'] = reference
 
         return self._http_call(
             self.MANIFEST, put, data=sign_manifest(content),
@@ -208,6 +267,11 @@ class BaseClientV2(CommonBaseClient):
         self.auth.desired_scope = 'repository:%s:*' % name
         return self._http_call(self.MANIFEST, delete,
                                name=name, reference=digest)
+
+    def copy_blob(self, origin, digest, destination):
+        self.auth.desired_scope = ['repository:%s:*' % repo for repo in (origin, destination)]
+        return self._http_call(self.BLOB_MOUNT, post,
+                               name=destination, digest=digest, origin=origin)
 
     def delete_blob(self, name, digest):
         self.auth.desired_scope = 'repository:%s:*' % name
@@ -260,28 +324,38 @@ class BaseClientV2(CommonBaseClient):
         response = method(self.host + path,
                           data=data, headers=header, **self.method_kwargs)
         logger.debug("%s %s", response.status_code, response.reason)
-        response.raise_for_status()
+
+        try:
+            response.raise_for_status()
+        except HTTPError as e:
+            if e.response.content:
+                logger.error('Error Response: {}'.format(response.content))
+            raise
 
         return response
 
 
-def BaseClient(host, verify_ssl=None, api_version=None, username=None,
-               password=None, auth_service_url=""):
+def BaseClient(host, verify_ssl=None, api_version=None, username=None, password=None,
+               auth_service_url="", auth_service_url_full="", auth_service_name=None,
+               api_timeout=None):
     if api_version == 1:
         return BaseClientV1(
             host, verify_ssl=verify_ssl, username=username, password=password,
+            api_timeout=api_timeout,
         )
     elif api_version == 2:
         return BaseClientV2(
             host, verify_ssl=verify_ssl, username=username, password=password,
-            auth_service_url=auth_service_url,
+            auth_service_url=auth_service_url, auth_service_url_full=auth_service_url_full,
+            auth_service_name=auth_service_name, api_timeout=api_timeout,
         )
     elif api_version is None:
         # Try V2 first
         logger.debug("checking for v2 API")
         v2_client = BaseClientV2(
             host, verify_ssl=verify_ssl, username=username, password=password,
-            auth_service_url=auth_service_url,
+            auth_service_url=auth_service_url, auth_service_url_full=auth_service_url_full,
+            auth_service_name=auth_service_name, api_timeout=api_timeout,
         )
         try:
             v2_client.check_status()
@@ -290,7 +364,7 @@ def BaseClient(host, verify_ssl=None, api_version=None, username=None,
                 logger.debug("falling back to v1 API")
                 return BaseClientV1(
                     host, verify_ssl=verify_ssl, username=username,
-                    password=password,
+                    password=password, api_timeout=api_timeout,
                 )
 
             raise
